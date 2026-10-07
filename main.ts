@@ -126,6 +126,7 @@ function normalizeAcceleratorForPlatform(accelerator: string): string {
 interface StickyNoteSettings {
   defaultFolder: string;
   defaultNoteColor: string;
+  enableCollapsibleNotes: boolean;
   globalToggleShortcuts: Record<DesktopPlatform, string>;
   topLevelNotePath: string | null;
   topLevelWindowPosition: WindowPosition | null;
@@ -149,12 +150,21 @@ function createDefaultSettings(): StickyNoteSettings {
   return {
     defaultFolder: "",
     defaultNoteColor: DEFAULT_COLOR,
+    enableCollapsibleNotes: false,
     globalToggleShortcuts: { ...DEFAULT_GLOBAL_SHORTCUTS },
     topLevelNotePath: null,
     topLevelWindowPosition: null,
     colorsByPath: {},
     stickyNoteLeafIds: []
   };
+}
+
+interface StickyActions {
+  pin: HTMLElement;
+  colorPicker: HTMLInputElement;
+  mode: HTMLElement;
+  hide: HTMLElement;
+  collapse?: HTMLElement;
 }
 
 interface StickyNoteWindow {
@@ -164,6 +174,11 @@ interface StickyNoteWindow {
   document: Document;
   window: NativeBrowserWindow;
   observer?: MutationObserver;
+  // Collapse state lives here rather than in the popout DOM: Obsidian rebuilds
+  // that DOM on focus and layout changes, so only the plugin can be relied on
+  // to know whether a window is collapsed and how tall it was before.
+  isCollapsed: boolean;
+  expandedSize?: { width: number; height: number };
 }
 
 interface PendingStickyNoteInitialization {
@@ -213,6 +228,9 @@ interface NativeBrowserWindow {
   close(): void;
   destroy(): void;
   getPosition(): [number, number];
+  getContentSize(): [number, number];
+  setContentSize(width: number, height: number): void;
+  webContents: { getZoomFactor(): number };
 }
 
 export default class DesktopStickyNotesPlugin extends Plugin {
@@ -537,6 +555,7 @@ export default class DesktopStickyNotesPlugin extends Plugin {
     this.settings = {
       defaultFolder: stored.defaultFolder ?? defaults.defaultFolder,
       defaultNoteColor: stored.defaultNoteColor ?? defaults.defaultNoteColor,
+      enableCollapsibleNotes: stored.enableCollapsibleNotes ?? defaults.enableCollapsibleNotes,
       globalToggleShortcuts,
       topLevelNotePath: stored.topLevelNotePath ?? defaults.topLevelNotePath,
       topLevelWindowPosition: stored.topLevelWindowPosition ?? defaults.topLevelWindowPosition,
@@ -816,6 +835,27 @@ export default class DesktopStickyNotesPlugin extends Plugin {
     nativeWindow.focus();
   }
 
+  async setCollapsibleNotesEnabled(enabled: boolean): Promise<void> {
+    this.settings.enableCollapsibleNotes = enabled;
+    await this.saveSettings();
+    // Turning the feature off removes the only control that can restore a
+    // collapsed window, so no note may stay collapsed without it.
+    if (!enabled) {
+      for (const note of this.allNotes()) {
+        try {
+          // Resizing is restored first so that it does not depend on the expand
+          // below: a window left at a fixed size has no control to unlock it.
+          if (!note.window.isDestroyed()) note.window.setResizable(true);
+          this.expandNote(note);
+        } catch {
+          // The remote proxy becomes invalid as soon as a window closes. One
+          // unusable window must not leave the remaining notes collapsed.
+        }
+      }
+    }
+    this.scheduleRefreshAllNotes();
+  }
+
   async setTopLevelNote(path: string | null): Promise<void> {
     this.settings.topLevelNotePath = path;
     await this.saveSettings();
@@ -890,7 +930,7 @@ export default class DesktopStickyNotesPlugin extends Plugin {
       return false;
     }
 
-    const note: StickyNoteWindow = { file, leaf, leafId, document, window: browserWindow };
+    const note: StickyNoteWindow = { file, leaf, leafId, document, window: browserWindow, isCollapsed: false };
     this.initializedLeaves.add(leaf);
     this.trackNote(note);
     try {
@@ -1123,10 +1163,18 @@ export default class DesktopStickyNotesPlugin extends Plugin {
     document.title = nativeTitle;
     window.setTitle(nativeTitle);
     document.body.classList.add("desktop-sticky-note");
+    this.applyCollapseClasses(note);
     document.querySelector(".workspace-tab-header-container")?.remove();
     this.applyColor(note, this.noteColor(note.file.path), false);
     this.configureWindowOwnership(note);
-    window.setResizable(true);
+    // The setting gates the collapsed branch as well: a note that is still
+    // collapsed after the feature was switched off has no control left to
+    // expand it, so its window must at least become resizable again.
+    if (note.isCollapsed && this.settings.enableCollapsibleNotes) {
+      this.syncCollapsedHeight(note);
+    } else {
+      window.setResizable(true);
+    }
     this.addStickyActions(note);
     this.observePresentation(note);
     this.rememberStickyNote(note);
@@ -1209,14 +1257,35 @@ export default class DesktopStickyNotesPlugin extends Plugin {
       && document.documentElement.style.getPropertyValue("--background-primary") === expectedColor
       && document.body.style.getPropertyValue("--sticky-note-background") === expectedColor
       && !document.querySelector(".workspace-tab-header-container")
-      && !!actions?.querySelector(".desktop-sticky-note-color-picker");
+      && !!this.findStickyActions(actions);
   }
 
   private addStickyActions(note: StickyNoteWindow): void {
     const view = note.leaf.view;
     if (!(view instanceof MarkdownView)) return;
     const actions = view.containerEl.querySelector(".view-actions");
-    actions?.empty();
+    if (!actions) return;
+    // prepareWindow() also runs when a click focuses an inactive note, that is
+    // between the mousedown and the mouseup of that click. Rebuilding the
+    // buttons then replaces the pressed button, so no click event fires and the
+    // first click on an inactive note is lost. Buttons that are still present
+    // are updated in place instead, and the bar is only rebuilt without them.
+    const existing = this.findStickyActions(actions);
+    if (existing) {
+      this.updateStickyActions(note, view, actions, existing);
+      return;
+    }
+    actions.empty();
+
+    if (this.settings.enableCollapsibleNotes) {
+      const collapse = view.addAction("chevron-down", "Collapse sticky note", () => {
+        this.toggleCollapsed(note);
+        this.updateCollapseButton(collapse, note.isCollapsed);
+      });
+      collapse.addClass("desktop-sticky-note-collapse");
+      // A rebuilt bar starts from the tracked state, like the in-place update.
+      this.updateCollapseButton(collapse, note.isCollapsed);
+    }
 
     const pin = view.addAction("pin", "Keep on top", () => {
       const pinned = !note.window.isAlwaysOnTop();
@@ -1229,9 +1298,10 @@ export default class DesktopStickyNotesPlugin extends Plugin {
       if (pinned) note.window.moveTop();
       this.updatePinButton(pin, note.window.isAlwaysOnTop());
     });
+    pin.addClass("desktop-sticky-note-pin");
     this.updatePinButton(pin, note.window.isAlwaysOnTop());
 
-    const colorPicker = actions?.createEl("input", {
+    const colorPicker = actions.createEl("input", {
       cls: "desktop-sticky-note-color-picker",
       attr: {
         type: "color",
@@ -1249,12 +1319,194 @@ export default class DesktopStickyNotesPlugin extends Plugin {
       void view.setState({ mode: nextMode }, { history: false });
       this.updateModeButton(mode, nextMode);
     });
+    mode.addClass("desktop-sticky-note-mode");
     this.updateModeButton(mode, view.getMode());
     view.addAction("x", "Hide sticky note", () => this.hideNote(note))
       .addClass("desktop-sticky-note-hide");
   }
 
+  private toggleCollapsed(note: StickyNoteWindow): void {
+    if (note.isCollapsed) {
+      this.expandNote(note);
+    } else {
+      this.collapseNote(note);
+    }
+  }
+
+  private collapseNote(note: StickyNoteWindow): void {
+    const { window } = note;
+    // The setting is re-checked here because saving it is asynchronous: a
+    // button rendered before the change can still be clicked in the meantime.
+    if (window.isDestroyed() || note.isCollapsed || !this.settings.enableCollapsibleNotes) return;
+    const [width, height] = window.getContentSize();
+    note.expandedSize = { width, height };
+    note.isCollapsed = true;
+    // The collapsed styling is applied before the header is measured so that
+    // the measurement is the height the header will actually be drawn at: in an
+    // expanded window the note body can squeeze the header below that height.
+    this.applyCollapseClasses(note);
+    // Without a measurement there is no height to collapse to. Guessing one
+    // could hide part of the header, and the window would then be locked at a
+    // size its controls do not fit into.
+    const collapsedHeight = this.collapsedHeight(note);
+    if (collapsedHeight === null) {
+      this.abandonCollapse(note);
+      return;
+    }
+    // Resize first: a non-resizable window ignores size changes on some
+    // platforms, so the window must still be resizable while it shrinks.
+    window.setContentSize(width, collapsedHeight);
+    // Programmatic resizing is not honored everywhere, notably under native
+    // Wayland, so the new size is read back before the note is committed to a
+    // collapsed state its window never entered.
+    if (!this.contentHeightReached(window, collapsedHeight)) {
+      // A window manager may clamp the request and apply part of it, so the
+      // window is put back before the recorded size is dropped. Restoring is
+      // harmless where the resize was ignored outright.
+      window.setContentSize(width, height);
+      this.abandonCollapse(note);
+      return;
+    }
+    // A collapsed window must not be dragged to a new height, which would
+    // silently replace the height that expanding is supposed to restore.
+    window.setResizable(false);
+  }
+
+  private abandonCollapse(note: StickyNoteWindow): void {
+    // Returns the note to the expanded state it never left. The window was not
+    // made fixed-size yet, so only the tracked state has to be undone. Both
+    // ways of failing to collapse report the same way: from the outside the
+    // window simply did not collapse.
+    note.isCollapsed = false;
+    delete note.expandedSize;
+    this.applyCollapseClasses(note);
+    new Notice("Collapsing is not supported by this window manager.");
+  }
+
+  private expandNote(note: StickyNoteWindow): void {
+    const { window } = note;
+    // Collapsing always records the expanded size, so a collapsed note without
+    // one is an inconsistent state rather than a case to guess a size for.
+    if (window.isDestroyed() || !note.isCollapsed || !note.expandedSize) return;
+    const { width, height } = note.expandedSize;
+    // The note is moved to the expanded state before the window is touched. A
+    // remote call that throws would otherwise leave a note reporting itself
+    // collapsed while nothing on screen can expand it again.
+    delete note.expandedSize;
+    note.isCollapsed = false;
+    this.applyCollapseClasses(note);
+    window.setResizable(true);
+    window.setContentSize(width, height);
+  }
+
+  private applyCollapseClasses(note: StickyNoteWindow): void {
+    // A one-way projection of the setting and of note.isCollapsed for
+    // stylesheets to hook into. The classes are never read back: Obsidian
+    // rebuilds this DOM, so the plugin remains the only source of truth.
+    const { classList } = note.document.body;
+    classList.toggle("desktop-sticky-note-collapsible", this.settings.enableCollapsibleNotes);
+    classList.toggle("desktop-sticky-note-collapsed", note.isCollapsed);
+  }
+
+  private syncCollapsedHeight(note: StickyNoteWindow): void {
+    const { window } = note;
+    const [width, height] = window.getContentSize();
+    // The header can become taller or shorter while a note is already collapsed
+    // (another theme, an Obsidian setting, a different zoom level), so every
+    // refresh re-fits the window instead of trusting the height it collapsed to.
+    // An unmeasurable header leaves the window alone: refreshes run on every
+    // focus change, and resizing to a guessed height would make the window
+    // flicker whenever a theme sizes the header only in some states.
+    const collapsedHeight = this.collapsedHeight(note);
+    if (collapsedHeight === null || height === collapsedHeight) return;
+    // Same order as collapseNote(): a non-resizable window ignores size changes
+    // on some platforms, so the window is resizable while it is resized.
+    window.setResizable(true);
+    window.setContentSize(width, collapsedHeight);
+    // The window is collapsed either way, so it must not be left resizable when
+    // the re-fit was ignored: dragging it would replace the height that
+    // expanding restores.
+    window.setResizable(false);
+  }
+
+  private contentHeightReached(window: NativeBrowserWindow, expectedHeight: number): boolean {
+    // A window manager may round the requested size, so an exact match is not
+    // required; a window that ignored the request stays at its old height.
+    const [, height] = window.getContentSize();
+    return Math.abs(height - expectedHeight) <= 1;
+  }
+
+  private collapsedHeight(note: StickyNoteWindow): number | null {
+    // Collapsing leaves exactly the note header visible. The header is measured
+    // instead of assumed so that a theme, a font size, or anything stacked
+    // above the header changes the collapsed height with it.
+    // The measurement is in CSS pixels within the web contents, so it can only
+    // be applied to the content size: the full window size would additionally
+    // contain an OS title bar whenever Obsidian runs with a native frame.
+    // Scoped to this note's own view: a popout can be split, and the header of
+    // another pane there says nothing about this note's height.
+    const header = note.leaf.view.containerEl.querySelector(".view-header");
+    const headerBottom = header?.getBoundingClientRect().bottom ?? 0;
+    // No usable measurement. Both callers then leave the window as it is: a
+    // guessed height could cut off the header the collapsed window consists of.
+    // Non-finite values are rejected as well, since NaN passes every comparison
+    // and would reach setContentSize() as an undefined height.
+    if (!Number.isFinite(headerBottom) || headerBottom <= 0) return null;
+    // Content sizes are device-independent pixels, and the zoom factor is
+    // exactly the conversion from the CSS pixels the header was measured in.
+    // The renderer's own viewport dimensions must not be used for this: right
+    // after a resize they can still report the previous size, which would make
+    // the window collapse to a few pixels.
+    const zoomFactor = note.window.webContents.getZoomFactor();
+    const dipsPerCssPixel = Number.isFinite(zoomFactor) && zoomFactor > 0 ? zoomFactor : 1;
+    return Math.ceil(headerBottom * dipsPerCssPixel);
+  }
+
+  private updateCollapseButton(button: HTMLElement, collapsed: boolean): void {
+    // Same no-op guard as the other buttons: see updatePinButton().
+    if (button.dataset.desktopStickyNoteCollapsed === String(collapsed)) return;
+    button.dataset.desktopStickyNoteCollapsed = String(collapsed);
+    setIcon(button, collapsed ? "chevron-right" : "chevron-down");
+    setTooltip(button, collapsed ? "Expand sticky note" : "Collapse sticky note");
+    button.setAttribute("aria-expanded", String(!collapsed));
+  }
+
+  // One predicate for both the observer and the refresh: a bar is complete
+  // exactly when every control is there, so neither can consider a bar the
+  // other would rebuild as intact.
+  private findStickyActions(actions: Element | null): StickyActions | null {
+    if (!actions) return null;
+    const pin = actions.querySelector<HTMLElement>(".desktop-sticky-note-pin");
+    const colorPicker = actions.querySelector<HTMLInputElement>(".desktop-sticky-note-color-picker");
+    const mode = actions.querySelector<HTMLElement>(".desktop-sticky-note-mode");
+    const hide = actions.querySelector<HTMLElement>(".desktop-sticky-note-hide");
+    if (!pin || !colorPicker || !mode || !hide) return null;
+    // The collapse button follows its setting, so a bar built under the other
+    // value is incomplete and gets rebuilt rather than patched.
+    const collapse = actions.querySelector<HTMLElement>(".desktop-sticky-note-collapse") ?? undefined;
+    if (this.settings.enableCollapsibleNotes !== !!collapse) return null;
+    return { pin, colorPicker, mode, hide, collapse };
+  }
+
+  private updateStickyActions(note: StickyNoteWindow, view: MarkdownView, actions: Element, buttons: StickyActions): void {
+    // The bar holds only the sticky-note controls, exactly as after a rebuild.
+    const stickyActions: Element[] = [buttons.pin, buttons.colorPicker, buttons.mode, buttons.hide];
+    if (buttons.collapse) stickyActions.push(buttons.collapse);
+    for (const child of Array.from(actions.children)) {
+      if (!stickyActions.includes(child)) child.remove();
+    }
+    if (buttons.collapse) this.updateCollapseButton(buttons.collapse, note.isCollapsed);
+    this.updatePinButton(buttons.pin, note.window.isAlwaysOnTop());
+    buttons.colorPicker.value = this.noteColor(note.file.path);
+    this.updateModeButton(buttons.mode, view.getMode());
+  }
+
+  // The button updates skip work when nothing changed: setIcon() replaces the
+  // icon element, and an in-place refresh during a click must leave the
+  // element the mouse went down on in place, or the click is dropped again.
   private updatePinButton(button: HTMLElement, pinned: boolean): void {
+    if (button.dataset.desktopStickyNotePinned === String(pinned)) return;
+    button.dataset.desktopStickyNotePinned = String(pinned);
     setIcon(button, pinned ? "pin-off" : "pin");
     setTooltip(button, pinned ? "Stop keeping on top" : "Keep on top");
   }
@@ -1273,6 +1525,9 @@ export default class DesktopStickyNotesPlugin extends Plugin {
   }
 
   private updateModeButton(button: HTMLElement, mode: string): void {
+    // Same no-op guard as updatePinButton().
+    if (button.dataset.desktopStickyNoteMode === mode) return;
+    button.dataset.desktopStickyNoteMode = mode;
     const editing = mode === "source";
     setIcon(button, editing ? "book-open" : "pencil");
     setTooltip(button, editing ? "Switch to reading view" : "Switch to edit mode");
@@ -1445,6 +1700,11 @@ class DesktopStickyNotesSettingTab extends PluginSettingTab {
         render: (setting) => this.addDefaultColorControl(setting)
       },
       {
+        name: "Collapsible sticky notes",
+        desc: "Adds a collapse button that shrinks a sticky note to its header.",
+        render: (setting) => this.addCollapsibleNotesControl(setting)
+      },
+      {
         name: "Global toggle shortcut",
         desc: "System-wide shortcut for toggling the top-level sticky note. Click the shortcut, press a new combination, or press escape to cancel.",
         render: (setting) => this.addGlobalShortcutControl(setting)
@@ -1467,6 +1727,9 @@ class DesktopStickyNotesSettingTab extends PluginSettingTab {
     this.addDefaultColorControl(new Setting(containerEl)
       .setName("Default note color")
       .setDesc("Background color used for notes that do not have a saved custom color."));
+    this.addCollapsibleNotesControl(new Setting(containerEl)
+      .setName("Collapsible sticky notes")
+      .setDesc("Adds a collapse button that shrinks a sticky note to its header."));
     this.addGlobalShortcutControl(new Setting(containerEl)
       .setName("Global toggle shortcut")
       .setDesc("System-wide shortcut for toggling the top-level sticky note. Click the shortcut, press a new combination, or press escape to cancel."));
@@ -1497,6 +1760,12 @@ class DesktopStickyNotesSettingTab extends PluginSettingTab {
         this.plugin.settings.defaultNoteColor = value;
         await this.plugin.saveSettings();
       }));
+  }
+
+  private addCollapsibleNotesControl(setting: Setting): void {
+    setting.addToggle((toggle) => toggle
+      .setValue(this.plugin.settings.enableCollapsibleNotes)
+      .onChange((value) => void this.plugin.setCollapsibleNotesEnabled(value)));
   }
 
   private addGlobalShortcutControl(setting: Setting): () => void {

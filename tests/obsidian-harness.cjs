@@ -50,10 +50,12 @@ class Element extends EventTarget {
 }
 class InputElement extends Element {}
 class WorkspaceWindow {}
+class View {}
 class TFile {
   constructor(path) { this.path = path; this.basename = path.split("/").pop().replace(/\.md$/, ""); }
 }
-class TextFileView {
+class TextFileView extends View {
+  navigation = true;
   saveCalls = 0;
   async save() { this.saveCalls++; }
 }
@@ -108,6 +110,7 @@ function createHarness(settings = {}, layoutReady = false, supportsDeferredViews
   let nextTimer = 0;
   let clockTime = 0;
   let nextLeaf = 0;
+  let activationClock = 0;
   let stored = structuredClone(settings);
   let layoutSavePending = false;
   let reloadCalls = 0;
@@ -116,18 +119,81 @@ function createHarness(settings = {}, layoutReady = false, supportsDeferredViews
   // leak from one simulated app into another restart or test case.
   class WorkspaceLeaf {
     getViewState() {
-      return { type: this.isDeferred || this.view instanceof MarkdownView ? "markdown" : "other", state: this.view.getState?.() ?? {} };
+      return {
+        type: this.isDeferred || this.view instanceof MarkdownView ? "markdown" : "other",
+        state: this.view.getState?.() ?? {},
+        ...(this.pinned ? { pinned: true } : {})
+      };
     }
     async setViewState(state) { await this.view.setState(state.state ?? {}); }
   }
 
-  const workspace = Object.assign(new Events(), {
+  // Leaf choice follows Obsidian 1.14.4's app.js, reduced to this fixture's
+  // one-leaf tab groups and without sidebars. The methods live on the
+  // prototype, as in Obsidian, so that a plugin's own-property override and
+  // its removal can be observed.
+  class Workspace extends Events {
+    setActiveLeaf(leaf) { this.activations++; this.activeLeaf = leaf; leaf.activeTime = ++activationClock; }
+    getActiveViewOfType(type) { return this.activeLeaf?.view instanceof type ? this.activeLeaf.view : null; }
+    // Obsidian walks [rootSplit, floatingSplit] by default and answers the
+    // visible leaf activated last, or else the first leaf it met.
+    getMostRecentLeaf(root) {
+      const roots = root === undefined ? null : Array.isArray(root) ? root : [root];
+      let first = null;
+      let recent = null;
+      for (const leaf of leaves.values()) {
+        if (roots && !roots.includes(leaf.getContainer())) continue;
+        first ??= leaf;
+        if (!recent || (leaf.activeTime ?? 0) > (recent.activeTime ?? 0)) recent = leaf;
+      }
+      return recent ?? first;
+    }
+    // A navigable active leaf is returned as it is, without activation.
+    // Otherwise the most recent navigable leaf in the active leaf's window is
+    // used, or a new tab there, and activated unless the flag is false.
+    getUnpinnedLeaf(activate = true) {
+      this.unpinnedLeafCalls.push(activate);
+      const canNavigate = (leaf) => leaf.view.navigation && !leaf.pinned;
+      const active = this.activeLeaf;
+      if (active && canNavigate(active)) return active;
+      const container = active?.getContainer() ?? this.rootSplit;
+      let leaf = null;
+      for (const candidate of leaves.values()) {
+        if (candidate.getContainer() !== container || !canNavigate(candidate)) continue;
+        if (!leaf || (candidate.activeTime ?? 0) > (leaf.activeTime ?? 0)) leaf = candidate;
+      }
+      leaf ??= newTabBeside(this.getMostRecentLeaf(container));
+      if (activate) this.setActiveLeaf(leaf);
+      return leaf;
+    }
+    // getLeaf(true) is createLeafInTabGroup(): a new tab beside
+    // getMostRecentLeaf(), not activated unless "focus new tab" is set.
+    getLeaf(newLeaf) {
+      if (newLeaf !== true) throw new Error("Only new tabs are modelled");
+      return newTabBeside(this.getMostRecentLeaf());
+    }
+  }
+  function newTabBeside(sibling) {
+    const leaf = addLeaf(`tab-${++nextLeaf}`, { popout: false });
+    leaf.container = sibling.getContainer();
+    leaf.document = sibling.document;
+    leaf.view.containerEl.ownerDocument = sibling.document;
+    return leaf;
+  }
+
+  const workspace = Object.assign(new Workspace(), {
     layoutReady,
     containerEl: { ownerDocument: mainDocument },
     layoutSaves: 0,
     saveRuns: 0,
     savedLayout: null,
     popoutsOpened: 0,
+    // Main-window leaves share one root, as in Obsidian; each popout leaf has
+    // its own WorkspaceWindow container.
+    rootSplit: {},
+    activeLeaf: null,
+    activations: 0,
+    unpinnedLeafCalls: [],
     onLayoutReady(callback) { if (this.layoutReady) callback(); else readyCallbacks.push(callback); },
     getLeafById(id) { return leaves.get(id) ?? null; },
     iterateAllLeaves(callback) { for (const leaf of leaves.values()) callback(leaf); },
@@ -177,7 +243,7 @@ function createHarness(settings = {}, layoutReady = false, supportsDeferredViews
     const view = new MarkdownView(file, document);
     view.app = app;
     if (state.mode) view.mode = state.mode;
-    const container = popout ? new WorkspaceWindow() : {};
+    const container = popout ? new WorkspaceWindow() : workspace.rootSplit;
     if (popout) Object.assign(container, { doc: document, win: document.defaultView });
     let resolveLoad;
     const leaf = Object.assign(new WorkspaceLeaf(), {
@@ -228,6 +294,7 @@ function createHarness(settings = {}, layoutReady = false, supportsDeferredViews
       destroy() { this.destroys++; this.destroyed = true; leaves.delete(id); },
       getPosition() { return [120, 160]; }
     };
+    view.leaf = leaf;
     leaf.nativeWindow = nativeWindow;
     if (native) windows.push(nativeWindow);
     if (popout) workspace.on("quit", (tasks) => {
@@ -253,7 +320,7 @@ function createHarness(settings = {}, layoutReady = false, supportsDeferredViews
     unload() { this.onunload(); for (const cleanup of this.cleanups) cleanup(); }
   }
   const obsidian = {
-    Plugin, MarkdownView, TextFileView, WorkspaceLeaf, WorkspaceWindow, TFile,
+    Plugin, View, MarkdownView, TextFileView, WorkspaceLeaf, WorkspaceWindow, TFile,
     Notice: class { constructor(message) { notices.push(message); } },
     Platform: { isMacOS: false, isWin: false },
     requireApiVersion: () => supportsDeferredViews,

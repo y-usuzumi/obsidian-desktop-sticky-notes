@@ -1,5 +1,5 @@
-import { MarkdownView, Notice, Platform, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TextFileView, WorkspaceLeaf, WorkspaceWindow, normalizePath, requireApiVersion, setIcon, setTooltip } from "obsidian";
-import type { App, SettingDefinitionItem, Tasks, ViewState } from "obsidian";
+import { MarkdownView, Notice, Platform, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TextFileView, View, WorkspaceLeaf, WorkspaceWindow, normalizePath, requireApiVersion, setIcon, setTooltip } from "obsidian";
+import type { App, SettingDefinitionItem, Tasks, ViewState, WorkspaceContainer, WorkspaceParent } from "obsidian";
 import { BrowserWindow, globalShortcut, screen } from "@electron/remote";
 
 const DEFAULT_COLOR = "#fff3a3";
@@ -131,6 +131,10 @@ interface StickyNoteSettings {
   topLevelWindowPosition: WindowPosition | null;
   colorsByPath: Record<string, string>;
   stickyNoteLeafIds: string[];
+  // While a sticky note has the focus, open files from navigation in
+  // Obsidian's other windows (the main window or an ordinary popout) instead
+  // of replacing the note.
+  openFilesOutsideStickyNotes: boolean;
 }
 
 type StoredStickyNoteSettings = Partial<Omit<StickyNoteSettings, "globalToggleShortcuts" | "stickyNoteLeafIds">> & {
@@ -153,7 +157,8 @@ function createDefaultSettings(): StickyNoteSettings {
     topLevelNotePath: null,
     topLevelWindowPosition: null,
     colorsByPath: {},
-    stickyNoteLeafIds: []
+    stickyNoteLeafIds: [],
+    openFilesOutsideStickyNotes: true
   };
 }
 
@@ -180,6 +185,17 @@ interface ReloadCommand {
 // this compatibility boundary to the one reload command and feature-check it.
 interface AppWithReloadCommand extends App {
   commands?: { commands?: Record<string, ReloadCommand | undefined> };
+}
+
+// The two workspace methods Obsidian uses to choose the leaf that takes the
+// next opened file. The public typings declare getUnpinnedLeaf without its
+// activate flag and mark it deprecated in favour of getLeaf(false), but
+// getLeaf(false) itself still goes through it, so it is the method to wrap.
+// Limit this compatibility boundary to these two methods.
+interface NavigationLeafChooser {
+  getMostRecentLeaf(root?: WorkspaceParent): WorkspaceLeaf | null;
+  // false hands the leaf back without making it the active leaf.
+  getUnpinnedLeaf(activate?: boolean): WorkspaceLeaf;
 }
 
 function createReloadTasks(): Tasks {
@@ -248,6 +264,7 @@ export default class DesktopStickyNotesPlugin extends Plugin {
     this.registerContextMenu();
     this.registerGlobalToggleShortcut();
     this.registerReloadLifecycle();
+    this.keepNavigationOutOfStickyWindows();
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => {
       this.restoreStickyNotes();
       this.scheduleRefreshAllNotes();
@@ -543,7 +560,10 @@ export default class DesktopStickyNotesPlugin extends Plugin {
       colorsByPath: stored.colorsByPath ?? defaults.colorsByPath,
       stickyNoteLeafIds: Array.isArray(stored.stickyNoteLeafIds)
         ? [...new Set(stored.stickyNoteLeafIds.filter((id): id is string => typeof id === "string" && id.length > 0))]
-        : []
+        : [],
+      openFilesOutsideStickyNotes: typeof stored.openFilesOutsideStickyNotes === "boolean"
+        ? stored.openFilesOutsideStickyNotes
+        : defaults.openFilesOutsideStickyNotes
     };
 
     if (Object.prototype.hasOwnProperty.call(stored, "globalToggleShortcut")) {
@@ -1363,13 +1383,142 @@ export default class DesktopStickyNotesPlugin extends Plugin {
     const stickyLeaves: WorkspaceLeaf[] = [];
     this.app.workspace.iterateAllLeaves((leaf) => {
       if (!(leaf.view instanceof MarkdownView) || leaf.view.file?.path !== path) return;
-      const document = leaf.view.containerEl.ownerDocument;
-      if (document.documentElement.dataset.desktopStickyNoteWindow === "true"
-        && document.body.classList.contains("desktop-sticky-note")) {
-        stickyLeaves.push(leaf);
-      }
+      if (this.leafIsInStickyWindow(leaf)) stickyLeaves.push(leaf);
     });
     return stickyLeaves;
+  }
+
+  private leafIsInStickyWindow(leaf: WorkspaceLeaf): boolean {
+    const document = leaf.view.containerEl.ownerDocument;
+    return document.documentElement.dataset.desktopStickyNoteWindow === "true"
+      && document.body.classList.contains("desktop-sticky-note");
+  }
+
+  // A sticky note shows one file and is not a place to browse the vault from.
+  // Obsidian, however, answers "which leaf takes this file" from the active
+  // leaf and from the most recently used leaf, and while a sticky note has the
+  // focus both point into its window: a file opened from the quick switcher, a
+  // link, a URI, or the file explorer then replaces the note in the sticky
+  // window. While a sticky note has the focus, the two answers are taken from
+  // the leaves outside sticky windows instead, so that navigation stays in
+  // Obsidian's other windows: the main window or an ordinary popout.
+  //
+  // Checked against Obsidian 1.13.7 and 1.14.4: getLeaf(false) calls
+  // getUnpinnedLeaf, and getLeaf(true | "tab"), getLeaf("split"), the new-tab
+  // command and the file explorer place their leaf next to getMostRecentLeaf().
+  // All of them are called on the workspace instance, so replacing the two
+  // methods there covers every caller. Replacing them is not part of the
+  // public API (see NavigationLeafChooser), so the wrappers fall back to
+  // Obsidian's own answer wherever they have nothing better to offer.
+  //
+  // The wrappers stay installed for the plugin's whole lifetime and read the
+  // "Open files outside sticky notes" setting on every call. Installing and
+  // removing them from the settings toggle instead would not be simpler:
+  // another plugin may wrap the same methods after us, and our wrapper cannot
+  // be cut out of that chain, so a pass-through condition is needed either way.
+  // Reading the setting here makes the toggle take effect without a restart.
+  private keepNavigationOutOfStickyWindows(): void {
+    const { workspace } = this.app;
+    const chooser = workspace as unknown as NavigationLeafChooser;
+    // Keep the methods exactly as found, so that unloading can put them back
+    // as they were: an own property is reassigned, an inherited one is
+    // exposed again by deleting the override.
+    const ownMostRecentLeaf = Object.prototype.hasOwnProperty.call(workspace, "getMostRecentLeaf");
+    const ownUnpinnedLeaf = Object.prototype.hasOwnProperty.call(workspace, "getUnpinnedLeaf");
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- Kept only to be restored on the workspace; calls go through the bound copy below.
+    const foundMostRecentLeaf = chooser.getMostRecentLeaf;
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- Kept only to be restored on the workspace; calls go through the bound copy below.
+    const foundUnpinnedLeaf = chooser.getUnpinnedLeaf;
+    const originalMostRecentLeaf = foundMostRecentLeaf.bind(workspace);
+    const originalUnpinnedLeaf = foundUnpinnedLeaf.bind(workspace);
+
+    // Redirect only while the setting is on and a sticky note has the focus.
+    // getMostRecentLeaf has other callers, which keep Obsidian's answer
+    // whenever the focus is elsewhere. While a sticky note has the focus they
+    // see the leaf outside it as well: notably, "Bookmark current view"
+    // then bookmarks that leaf rather than the sticky note. Telling those
+    // callers apart from the leaf-choosing ones would mean wrapping more
+    // internals (createLeafInTabGroup, splitActiveLeaf), so the README states
+    // this limitation instead. notesByPath is empty after the
+    // plugin has unloaded, so a wrapper left in another plugin's chain then
+    // passes every call straight through unchanged.
+    const stickyNoteHasFocus = () => {
+      if (!this.settings.openFilesOutsideStickyNotes || !this.notesByPath.size) return false;
+      const active = workspace.getActiveViewOfType(View)?.leaf;
+      return !!active && this.leafIsInStickyWindow(active);
+    };
+
+    const getMostRecentLeaf: NavigationLeafChooser["getMostRecentLeaf"] = (root) => {
+      if (root || !stickyNoteHasFocus()) return originalMostRecentLeaf(root);
+      // Obsidian's default is [rootSplit, floatingSplit], and it walks an
+      // array of roots one by one. The main window plus the popouts other than
+      // sticky windows keeps its choice among the remaining windows exactly as
+      // it would have been. Should a later version stop accepting an array,
+      // and answer with nothing or throw, Obsidian's own answer is used.
+      try {
+        const outside = originalMostRecentLeaf(this.rootsOutsideStickyWindows() as unknown as WorkspaceParent);
+        if (outside) return outside;
+      } catch {
+        // Fall through to Obsidian's own answer below.
+      }
+      return originalMostRecentLeaf();
+    };
+    const getUnpinnedLeaf: NavigationLeafChooser["getUnpinnedLeaf"] = (activate) => {
+      // Pass the caller's argument through as given, so that Obsidian's own
+      // default for a missing flag (true) applies when nothing is redirected.
+      if (!stickyNoteHasFocus()) return originalUnpinnedLeaf(activate);
+      const recent = workspace.getMostRecentLeaf();
+      // Never hand out a sticky leaf: with no leaf outside sticky windows,
+      // there is nothing to redirect to, and Obsidian decides as usual.
+      if (!recent || this.leafIsInStickyWindow(recent)) return originalUnpinnedLeaf(activate);
+      // A leaf that cannot be navigated, because its tab is pinned or its view
+      // is not a file view, gets a new tab beside it, as Obsidian does when
+      // the active leaf is pinned. getLeaf(true) places the tab next to
+      // getMostRecentLeaf(), which is the same leaf outside sticky windows.
+      // Obsidian's own check is leaf.canNavigate(), which is not in the
+      // public API; the view state carries the same pinned flag.
+      const leaf = recent.view.navigation && !recent.getViewState().pinned
+        ? recent
+        : workspace.getLeaf(true);
+      // The leaf Obsidian hands out is the active leaf, and opening a file
+      // without saying otherwise activates the leaf only if it already is.
+      // Without this, the file opens behind the sticky note and the window
+      // holding the leaf does not come forward.
+      if (activate !== false) workspace.setActiveLeaf(leaf);
+      return leaf;
+    };
+
+    chooser.getMostRecentLeaf = getMostRecentLeaf;
+    chooser.getUnpinnedLeaf = getUnpinnedLeaf;
+    this.register(() => {
+      // Another plugin may have wrapped these since. Its wrapper still calls
+      // through to ours, which passes straight through once the notes are
+      // gone, so it is left in place rather than cut out from under that
+      // plugin. The retained closure costs one extra call per lookup until
+      // Obsidian restarts.
+      if (chooser.getMostRecentLeaf === getMostRecentLeaf) {
+        if (ownMostRecentLeaf) chooser.getMostRecentLeaf = foundMostRecentLeaf;
+        else delete (chooser as Partial<NavigationLeafChooser>).getMostRecentLeaf;
+      }
+      if (chooser.getUnpinnedLeaf === getUnpinnedLeaf) {
+        if (ownUnpinnedLeaf) chooser.getUnpinnedLeaf = foundUnpinnedLeaf;
+        else delete (chooser as Partial<NavigationLeafChooser>).getUnpinnedLeaf;
+      }
+    });
+  }
+
+  private rootsOutsideStickyWindows(): WorkspaceContainer[] {
+    const { workspace } = this.app;
+    // getContainer() answers rootSplit for sidebar leaves as well, so the set
+    // holds the main window plus one entry per popout other than sticky ones.
+    // A sticky window that the plugin has not initialized yet (for example
+    // while restoration is still loading it) carries no marker and counts as
+    // an ordinary popout until then.
+    const roots = new Set<WorkspaceContainer>([workspace.rootSplit]);
+    workspace.iterateAllLeaves((leaf) => {
+      if (!this.leafIsInStickyWindow(leaf)) roots.add(leaf.getContainer());
+    });
+    return [...roots];
   }
 
   private nativeNoteWindowsForPath(path: string): NativeBrowserWindow[] {
@@ -1453,6 +1602,11 @@ class DesktopStickyNotesSettingTab extends PluginSettingTab {
         name: "Top-level sticky note",
         desc: this.plugin.settings.topLevelNotePath ?? "No top-level note selected.",
         render: (setting) => this.addTopLevelNoteControl(setting)
+      },
+      {
+        name: "Open files outside sticky notes",
+        desc: "While a sticky note has the focus, files opened from the quick switcher, the file explorer, links, commands, or other apps open in another window of Obsidian (the main window or an ordinary popout) instead of replacing the sticky note.",
+        render: (setting) => this.addOpenFilesOutsideStickyNotesControl(setting)
       }
     ];
   }
@@ -1473,6 +1627,9 @@ class DesktopStickyNotesSettingTab extends PluginSettingTab {
     this.addTopLevelNoteControl(new Setting(containerEl)
       .setName("Top-level sticky note")
       .setDesc(this.plugin.settings.topLevelNotePath ?? "No top-level note selected."));
+    this.addOpenFilesOutsideStickyNotesControl(new Setting(containerEl)
+      .setName("Open files outside sticky notes")
+      .setDesc("While a sticky note has the focus, files opened from the quick switcher, the file explorer, links, commands, or other apps open in another window of Obsidian (the main window or an ordinary popout) instead of replacing the sticky note."));
   }
 
   hide(): void {
@@ -1531,6 +1688,17 @@ class DesktopStickyNotesSettingTab extends PluginSettingTab {
         clearButton = button.buttonEl;
       });
     return () => this.stopShortcutRecording(true);
+  }
+
+  private addOpenFilesOutsideStickyNotesControl(setting: Setting): void {
+    // The workspace wrappers read this value on every call, so a change
+    // applies to the next file opened without reloading the plugin.
+    setting.addToggle((toggle) => toggle
+      .setValue(this.plugin.settings.openFilesOutsideStickyNotes)
+      .onChange(async (value) => {
+        this.plugin.settings.openFilesOutsideStickyNotes = value;
+        await this.plugin.saveSettings();
+      }));
   }
 
   private addTopLevelNoteControl(setting: Setting): void {

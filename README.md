@@ -44,7 +44,7 @@ Then enable **Desktop Sticky Notes** under Obsidian's community-plugin settings.
 
 ## Permissions and privacy
 
-Desktop Sticky Notes uses Obsidian's Electron APIs to manage popout windows and register the optional system-wide shortcut. It only creates or edits Markdown files inside your vault through the Obsidian API. It does not access files outside the vault, make network requests, collect telemetry, or send data anywhere.
+Desktop Sticky Notes uses Obsidian's Electron APIs to manage popout windows and register the optional system-wide shortcut. It reaches them through the `@electron/remote` instance that Obsidian itself provides, not a copy of its own. It only creates or edits Markdown files inside your vault through the Obsidian API. It does not access files outside the vault, make network requests, collect telemetry, or send data anywhere.
 
 ## License
 

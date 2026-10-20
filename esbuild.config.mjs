@@ -9,7 +9,10 @@ const context = await esbuild.context({
   format: "cjs",
   platform: "node",
   target: "es2022",
-  external: ["obsidian", "electron"],
+  // @electron/remote must never be bundled: the plugin uses the instance
+  // Obsidian attaches to the Electron module (see obsidianRemote in main.ts),
+  // and a bundled copy would run a second callback registry beside it.
+  external: ["obsidian", "electron", "@electron/remote"],
   minify: !watch,
   sourcemap: watch ? "inline" : false,
   logLevel: "info"

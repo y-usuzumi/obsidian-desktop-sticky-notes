@@ -1,6 +1,25 @@
 import { MarkdownView, Notice, Platform, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TextFileView, WorkspaceLeaf, WorkspaceWindow, normalizePath, requireApiVersion, setIcon, setTooltip } from "obsidian";
 import type { App, SettingDefinitionItem, Tasks, ViewState } from "obsidian";
-import { BrowserWindow, globalShortcut, screen } from "@electron/remote";
+import electron from "electron";
+
+type ElectronRemote = typeof import("@electron/remote");
+
+// Obsidian attaches its own @electron/remote to the Electron module it hands
+// out (as `remote`), and that instance is the only one this plugin may use.
+// A bundled copy of @electron/remote would run a second renderer-side
+// registry of callbacks next to Obsidian's: both number their callbacks from
+// one, and both listen on the same IPC channel for "run callback N", so a
+// window event listener or a promise resolution registered by one instance
+// fires whatever the other instance holds under the same number, such as the
+// click handler of a native menu item. Obsidian's registry is shared instead,
+// so every callback gets a number of its own.
+function obsidianRemote(): ElectronRemote {
+  const { remote } = electron as { remote?: ElectronRemote };
+  if (!remote) throw new Error("Desktop Sticky Notes needs the @electron/remote instance that Obsidian attaches to its Electron module.");
+  return remote;
+}
+
+const { BrowserWindow, globalShortcut, screen } = obsidianRemote();
 
 const DEFAULT_COLOR = "#fff3a3";
 const DEFAULT_WIDTH = 360;

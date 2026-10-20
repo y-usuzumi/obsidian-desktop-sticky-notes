@@ -261,7 +261,11 @@ function createHarness(settings = {}, layoutReady = false, supportsDeferredViews
     setIcon: (element, icon) => { element.icon = icon; },
     setTooltip: (element, title) => { element.title = title; }
   };
-  const electron = {
+  // Stands in for the @electron/remote instance Obsidian attaches to its
+  // Electron module. The plugin must reach it only through
+  // require("electron").remote, so a direct require of "@electron/remote"
+  // falls through to the "Unexpected dependency" error below.
+  const remote = {
     BrowserWindow: { getAllWindows: () => windows },
     globalShortcut: {
       isRegistered: (accelerator) => shortcuts.has(accelerator),
@@ -275,7 +279,7 @@ function createHarness(settings = {}, layoutReady = false, supportsDeferredViews
     module, exports: module.exports,
     require: (name) => {
       if (name === "obsidian") return obsidian;
-      if (name === "@electron/remote") return electron;
+      if (name === "electron") return { remote };
       throw new Error(`Unexpected dependency: ${name}`);
     },
     window: {

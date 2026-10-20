@@ -157,6 +157,13 @@ function createDefaultSettings(): StickyNoteSettings {
   };
 }
 
+interface StickyActions {
+  pin: HTMLElement;
+  colorPicker: HTMLInputElement;
+  mode: HTMLElement;
+  hide: HTMLElement;
+}
+
 interface StickyNoteWindow {
   file: TFile;
   leaf: WorkspaceLeaf;
@@ -218,6 +225,8 @@ interface NativeBrowserWindow {
 export default class DesktopStickyNotesPlugin extends Plugin {
   settings: StickyNoteSettings = createDefaultSettings();
   private notesByPath = new Map<string, Set<StickyNoteWindow>>();
+  // The note each kept header bar was last refreshed for; see addStickyActions().
+  private stickyActionNotes = new WeakMap<Element, StickyNoteWindow>();
   private initializedLeaves = new WeakSet<WorkspaceLeaf>();
   private stickyStateLeaves = new WeakSet<WorkspaceLeaf>();
   private initializingLeaves = new Map<WorkspaceLeaf, PendingStickyNoteInitialization>();
@@ -1112,7 +1121,7 @@ export default class DesktopStickyNotesPlugin extends Plugin {
   }
 
   private prepareWindow(note: StickyNoteWindow): void {
-    if (this.unloading || this.quitting || !this.initializedLeaves.has(note.leaf) || note.window.isDestroyed()) return;
+    if (this.unloading || this.quitting || !this.isTrackedNote(note) || note.window.isDestroyed()) return;
     if (note.leaf.view.containerEl.ownerDocument !== note.document) return;
     const { document, window } = note;
     const nativeTitle = this.nativeNoteWindowTitle(note.file);
@@ -1209,29 +1218,50 @@ export default class DesktopStickyNotesPlugin extends Plugin {
       && document.documentElement.style.getPropertyValue("--background-primary") === expectedColor
       && document.body.style.getPropertyValue("--sticky-note-background") === expectedColor
       && !document.querySelector(".workspace-tab-header-container")
-      && !!actions?.querySelector(".desktop-sticky-note-color-picker");
+      && !!this.findStickyActions(actions);
   }
 
   private addStickyActions(note: StickyNoteWindow): void {
     const view = note.leaf.view;
     if (!(view instanceof MarkdownView)) return;
     const actions = view.containerEl.querySelector(".view-actions");
-    actions?.empty();
+    if (!actions) return;
+    this.stickyActionNotes.set(actions, note);
+    // prepareWindow() also runs when a click focuses an inactive note, that is
+    // between the mousedown and the mouseup of that click. Rebuilding the
+    // buttons then replaces the pressed button, so no click event fires and the
+    // first click on an inactive note is lost. Buttons that are still present
+    // are updated in place instead, and the bar is only rebuilt without them.
+    const existing = this.findStickyActions(actions);
+    if (existing) {
+      this.updateStickyActions(note, view, actions, existing);
+      return;
+    }
+    actions.empty();
+
+    // The kept bar outlives `note`, because the same leaf can be initialized
+    // again with a new note object, and renames update only that new one. The
+    // handlers therefore act on the note this bar was last refreshed for, as
+    // they did when every refresh rebuilt the bar. `view` can be captured: the
+    // bar lives in view.containerEl, so a new view brings a new bar.
+    const currentNote = () => this.stickyActionNotes.get(actions) ?? note;
 
     const pin = view.addAction("pin", "Keep on top", () => {
-      const pinned = !note.window.isAlwaysOnTop();
+      const target = currentNote();
+      const pinned = !target.window.isAlwaysOnTop();
       // A child window's stacking is constrained by its application parent on
       // some window managers. Promote it to a native top-level window before
       // enabling the OS-wide always-on-top state.
-      if (pinned) note.window.setParentWindow(null);
-      note.window.setAlwaysOnTop(pinned);
-      this.configureWindowOwnership(note);
-      if (pinned) note.window.moveTop();
-      this.updatePinButton(pin, note.window.isAlwaysOnTop());
+      if (pinned) target.window.setParentWindow(null);
+      target.window.setAlwaysOnTop(pinned);
+      this.configureWindowOwnership(target);
+      if (pinned) target.window.moveTop();
+      this.updatePinButton(pin, target.window.isAlwaysOnTop());
     });
+    pin.addClass("desktop-sticky-note-pin");
     this.updatePinButton(pin, note.window.isAlwaysOnTop());
 
-    const colorPicker = actions?.createEl("input", {
+    const colorPicker = actions.createEl("input", {
       cls: "desktop-sticky-note-color-picker",
       attr: {
         type: "color",
@@ -1241,7 +1271,7 @@ export default class DesktopStickyNotesPlugin extends Plugin {
       }
     });
     if (colorPicker instanceof HTMLInputElement) {
-      this.registerDomEvent(colorPicker, "input", () => this.applyColor(note, colorPicker.value));
+      this.registerDomEvent(colorPicker, "input", () => this.applyColor(currentNote(), colorPicker.value));
       this.registerDomEvent(colorPicker, "click", (event) => event.stopPropagation());
     }
     const mode = view.addAction("pencil", "Switch to edit mode", () => {
@@ -1249,12 +1279,42 @@ export default class DesktopStickyNotesPlugin extends Plugin {
       void view.setState({ mode: nextMode }, { history: false });
       this.updateModeButton(mode, nextMode);
     });
+    mode.addClass("desktop-sticky-note-mode");
     this.updateModeButton(mode, view.getMode());
-    view.addAction("x", "Hide sticky note", () => this.hideNote(note))
+    view.addAction("x", "Hide sticky note", () => this.hideNote(currentNote()))
       .addClass("desktop-sticky-note-hide");
   }
 
+  // One predicate for both the observer and the refresh: a bar is complete
+  // exactly when every control is there, so neither can consider a bar the
+  // other would rebuild as intact.
+  private findStickyActions(actions: Element | null): StickyActions | null {
+    if (!actions) return null;
+    const pin = actions.querySelector<HTMLElement>(".desktop-sticky-note-pin");
+    const colorPicker = actions.querySelector<HTMLInputElement>(".desktop-sticky-note-color-picker");
+    const mode = actions.querySelector<HTMLElement>(".desktop-sticky-note-mode");
+    const hide = actions.querySelector<HTMLElement>(".desktop-sticky-note-hide");
+    if (!pin || !colorPicker || !mode || !hide) return null;
+    return { pin, colorPicker, mode, hide };
+  }
+
+  private updateStickyActions(note: StickyNoteWindow, view: MarkdownView, actions: Element, buttons: StickyActions): void {
+    // The bar holds only the sticky-note controls, exactly as after a rebuild.
+    const stickyActions: Element[] = [buttons.pin, buttons.colorPicker, buttons.mode, buttons.hide];
+    for (const child of Array.from(actions.children)) {
+      if (!stickyActions.includes(child)) child.remove();
+    }
+    this.updatePinButton(buttons.pin, note.window.isAlwaysOnTop());
+    buttons.colorPicker.value = this.noteColor(note.file.path);
+    this.updateModeButton(buttons.mode, view.getMode());
+  }
+
+  // The button updates skip work when nothing changed: setIcon() replaces the
+  // icon element, and an in-place refresh during a click must leave the
+  // element the mouse went down on in place, or the click is dropped again.
   private updatePinButton(button: HTMLElement, pinned: boolean): void {
+    if (button.dataset.desktopStickyNotePinned === String(pinned)) return;
+    button.dataset.desktopStickyNotePinned = String(pinned);
     setIcon(button, pinned ? "pin-off" : "pin");
     setTooltip(button, pinned ? "Stop keeping on top" : "Keep on top");
   }
@@ -1273,6 +1333,9 @@ export default class DesktopStickyNotesPlugin extends Plugin {
   }
 
   private updateModeButton(button: HTMLElement, mode: string): void {
+    // Same no-op guard as updatePinButton().
+    if (button.dataset.desktopStickyNoteMode === mode) return;
+    button.dataset.desktopStickyNoteMode = mode;
     const editing = mode === "source";
     setIcon(button, editing ? "book-open" : "pencil");
     setTooltip(button, editing ? "Switch to reading view" : "Switch to edit mode");
@@ -1299,6 +1362,15 @@ export default class DesktopStickyNotesPlugin extends Plugin {
     const notes = this.notesByPath.get(note.file.path) ?? new Set<StickyNoteWindow>();
     notes.add(note);
     this.notesByPath.set(note.file.path, notes);
+  }
+
+  // The leaf alone does not identify the current note: the same leaf can be
+  // initialized again with a new note object while the old object's focus and
+  // blur listeners stay registered until unload. Only the tracked object has
+  // the current path after a rename, so a refresh through the old object would
+  // write the old path and point the kept header buttons back at it.
+  private isTrackedNote(note: StickyNoteWindow): boolean {
+    return this.initializedLeaves.has(note.leaf) && !!this.notesByPath.get(note.file.path)?.has(note);
   }
 
   private untrackNote(note: StickyNoteWindow): void {

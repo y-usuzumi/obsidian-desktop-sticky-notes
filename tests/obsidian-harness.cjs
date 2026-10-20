@@ -39,11 +39,13 @@ class Element extends EventTarget {
   };
   addClass(name) { this.classList.add(name); return this; }
   empty() { this.children = []; }
+  remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); }
   querySelector(selector) { return this.children.find((child) => child.classList.contains(selector.slice(1))) ?? null; }
   createEl(tag, options) {
     const element = tag === "input" ? new InputElement() : new Element();
     element.addClass(options.cls);
     Object.assign(element, options.attr);
+    element.parent = this;
     this.children.push(element);
     return element;
   }
@@ -70,7 +72,7 @@ class MarkdownView extends TextFileView {
   }
   addAction(icon, title, callback) {
     const action = new Element();
-    Object.assign(action, { icon, title, callback });
+    Object.assign(action, { icon, title, callback, parent: this.actions });
     this.actions.children.push(action);
     return action;
   }

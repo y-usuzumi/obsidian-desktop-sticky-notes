@@ -31,7 +31,12 @@ class Element extends EventTarget {
   classList = {
     add: (name) => this.classes.add(name),
     remove: (name) => this.classes.delete(name),
-    contains: (name) => this.classes.has(name)
+    contains: (name) => this.classes.has(name),
+    // DOMTokenList semantics: an explicit force sets the state, otherwise flip it.
+    toggle: (name, force = !this.classes.has(name)) => {
+      if (force) this.classes.add(name); else this.classes.delete(name);
+      return force;
+    }
   };
   style = {
     setProperty: (name, value) => this.properties.set(name, value),
@@ -96,7 +101,7 @@ function createDocument() {
   return document;
 }
 
-function createHarness(settings = {}, layoutReady = false, supportsDeferredViews = true) {
+function createHarness(settings = {}, layoutReady = false, supportsDeferredViews = true, { macOS = false } = {}) {
   const mainDocument = createDocument();
   const leaves = new Map();
   const files = new Map();
@@ -226,7 +231,11 @@ function createHarness(settings = {}, layoutReady = false, supportsDeferredViews
         if (popout) workspace.trigger("window-close", container, document.defaultView);
       },
       destroy() { this.destroys++; this.destroyed = true; leaves.delete(id); },
-      getPosition() { return [120, 160]; }
+      getPosition() { return [120, 160]; },
+      // Electron only provides this on macOS. Every call is recorded so tests
+      // can assert both the final state and how often the main process is hit.
+      buttonVisibilityCalls: [],
+      setWindowButtonVisibility(visible) { this.buttonVisibilityCalls.push(visible); }
     };
     leaf.nativeWindow = nativeWindow;
     if (native) windows.push(nativeWindow);
@@ -255,7 +264,7 @@ function createHarness(settings = {}, layoutReady = false, supportsDeferredViews
   const obsidian = {
     Plugin, MarkdownView, TextFileView, WorkspaceLeaf, WorkspaceWindow, TFile,
     Notice: class { constructor(message) { notices.push(message); } },
-    Platform: { isMacOS: false, isWin: false },
+    Platform: { isMacOS: macOS, isWin: false },
     requireApiVersion: () => supportsDeferredViews,
     PluginSettingTab: class {},
     setIcon: (element, icon) => { element.icon = icon; },

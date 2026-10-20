@@ -72,6 +72,100 @@ body.desktop-sticky-note .desktop-sticky-note-color-picker::-webkit-color-swatch
   border-radius: 50%;
 }
 
+/* Compact header. Applied only when the "Header size" setting is not "default";
+   prepareWindow() keeps these body classes in sync with the setting. */
+
+body.desktop-sticky-note.desktop-sticky-note-compact {
+  /* Retint both header background tokens rather than the header itself: the
+     focused variant is applied by a more specific Obsidian rule that a plain
+     background declaration here would lose to. */
+  --file-header-background: var(--sticky-note-background);
+  --file-header-background-focused: var(--sticky-note-background);
+  /* Obsidian derives these from --header-height and passes them to Electron's
+     setTrafficLightPosition, so shrinking the header would drag the macOS
+     window buttons into the corner on the frame styles that keep them. 40px is
+     Obsidian's own default --header-height, so a theme that changes that value
+     leaves the buttons a few pixels off under the Obsidian frame style. */
+  --traffic-lights-offset-x: 40px;
+  --traffic-lights-offset-y: 40px;
+  /* The header's height includes its bottom border, whose width is Obsidian's
+     --border-width, so its children have to stop short of it to stay inside. */
+  --sticky-note-header-inner-height: calc(var(--header-height) - var(--border-width));
+}
+
+body.desktop-sticky-note.desktop-sticky-note-header-small {
+  --header-height: 20px;
+  --sticky-note-header-icon-size: 14px;
+}
+
+body.desktop-sticky-note.desktop-sticky-note-header-extra-small {
+  --header-height: 14px;
+  --sticky-note-header-icon-size: 12px;
+}
+
+body.desktop-sticky-note.desktop-sticky-note-compact .view-header {
+  /* Obsidian derives .view-content's height from --header-height, so the header
+     must be exactly that tall or the note body is offset by the difference. */
+  height: var(--header-height);
+  min-height: var(--header-height);
+  /* The popout is frameless, so its resize edges sit directly on the header.
+     The horizontal padding keeps the outermost buttons out of that grab area. */
+  padding: 0 10px;
+}
+
+body.desktop-sticky-note.desktop-sticky-note-compact .view-header .view-header-title-container,
+body.desktop-sticky-note.desktop-sticky-note-compact .view-header .view-header-nav-buttons,
+body.desktop-sticky-note.desktop-sticky-note-compact .view-header .view-actions {
+  height: var(--sticky-note-header-inner-height);
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+body.desktop-sticky-note.desktop-sticky-note-compact .view-header .view-header-nav-buttons {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin: 0;
+}
+
+body.desktop-sticky-note.desktop-sticky-note-compact .view-header .view-action,
+body.desktop-sticky-note.desktop-sticky-note-compact .view-header .clickable-icon {
+  height: var(--sticky-note-header-inner-height);
+  /* No vertical padding: at the extra-small size the button is only a pixel
+     taller than the icon it holds. */
+  padding: 0 2px;
+  --icon-size: var(--sticky-note-header-icon-size);
+}
+
+body.desktop-sticky-note.desktop-sticky-note-compact .view-header .view-header-title {
+  font-size: var(--font-ui-smaller);
+  /* The container centres its content, so the line box only has to be tight
+     enough that descenders are not clipped by the shortened row. */
+  line-height: 1;
+}
+
+body.desktop-sticky-note.desktop-sticky-note-compact .desktop-sticky-note-color-picker {
+  /* Even sizes only: at an odd size the 1px ring lands on half device pixels and
+     renders thicker on some sides than others on Retina displays. */
+  width: var(--sticky-note-header-icon-size);
+  height: var(--sticky-note-header-icon-size);
+  margin: 0 2px;
+  /* Obsidian sizes the inner swatch from these variables (22px by default), so
+     they have to follow the shrunken input or the swatch overflows it. */
+  --swatch-width: var(--sticky-note-header-icon-size);
+  --swatch-height: var(--sticky-note-header-icon-size);
+  --swatch-radius: 50%;
+  /* The ring goes through Obsidian's own variable rather than a box-shadow on
+     the swatch, so that its hover and focus rings still replace it. */
+  --swatch-shadow: inset 0 0 0 1px var(--background-modifier-border);
+}
+
+body.desktop-sticky-note.desktop-sticky-note-compact .desktop-sticky-note-color-picker::-webkit-color-swatch {
+  /* Drops the border of the default appearance; --swatch-shadow draws the ring
+     instead so that Obsidian's hover and focus rings can replace it. */
+  border: 0;
+}
+
 .desktop-sticky-note-shortcut-recorder {
   min-width: 132px;
   font-family: var(--font-monospace);

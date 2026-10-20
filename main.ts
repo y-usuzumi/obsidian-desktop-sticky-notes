@@ -14,6 +14,9 @@ const RELOAD_WINDOW_CLOSE_ATTEMPTS = 40;
 const RELOAD_WINDOW_CLOSE_INTERVAL = 50;
 const WINDOW_NAME_PREFIX = "desktop-sticky-notes:";
 const STICKY_VIEW_STATE_KEY = "desktopStickyNote";
+const MIN_WINDOW_OPACITY = 0.2;
+const FULL_WINDOW_OPACITY = 1;
+const WINDOW_OPACITY_STEP = 0.05;
 const LEGACY_DEFAULT_GLOBAL_SHORTCUT = "CommandOrControl+Alt+N";
 
 type DesktopPlatform = "linux" | "macos" | "windows";
@@ -123,9 +126,24 @@ function normalizeAcceleratorForPlatform(accelerator: string): string {
   }).join("+");
 }
 
+function isWindowOpacity(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value)
+    && value >= MIN_WINDOW_OPACITY && value <= FULL_WINDOW_OPACITY;
+}
+
+function normalizeWindowOpacity(value: number): number {
+  // Keeps the stored value on the slider's own grid, so that the persisted
+  // value, the slider position and the applied opacity always agree, whether
+  // the value came from the slider or from a hand-edited data.json.
+  return Math.round(Math.round(value / WINDOW_OPACITY_STEP) * WINDOW_OPACITY_STEP * 100) / 100;
+}
+
 interface StickyNoteSettings {
   defaultFolder: string;
   defaultNoteColor: string;
+  windowOpacity: number;
+  // Also covers hovering; the stored name predates that.
+  opaqueWhileFocused: boolean;
   globalToggleShortcuts: Record<DesktopPlatform, string>;
   topLevelNotePath: string | null;
   topLevelWindowPosition: WindowPosition | null;
@@ -149,6 +167,8 @@ function createDefaultSettings(): StickyNoteSettings {
   return {
     defaultFolder: "",
     defaultNoteColor: DEFAULT_COLOR,
+    windowOpacity: FULL_WINDOW_OPACITY,
+    opaqueWhileFocused: true,
     globalToggleShortcuts: { ...DEFAULT_GLOBAL_SHORTCUTS },
     topLevelNotePath: null,
     topLevelWindowPosition: null,
@@ -164,6 +184,12 @@ interface StickyNoteWindow {
   document: Document;
   window: NativeBrowserWindow;
   observer?: MutationObserver;
+  // Opacity last applied to the native window, whether the setting or full
+  // opacity for a focused or hovered window, so that repeated passes can skip
+  // the remote call while the target is unchanged.
+  appliedOpacity?: number;
+  // Whether the pointer is over the window, which keeps it opaque like the focus.
+  isHovered?: boolean;
 }
 
 interface PendingStickyNoteInitialization {
@@ -210,6 +236,7 @@ interface NativeBrowserWindow {
   moveTop(): void;
   setParentWindow(parent: NativeBrowserWindow | null): void;
   setSkipTaskbar(skip: boolean): void;
+  setOpacity(opacity: number): void;
   close(): void;
   destroy(): void;
   getPosition(): [number, number];
@@ -231,6 +258,7 @@ export default class DesktopStickyNotesPlugin extends Plugin {
   private discoveringRestoredLeaves = true;
   private registeredGlobalShortcut: string | null = null;
   private shortcutRegistrationTimer: number | null = null;
+  private opacitySaveTimer: number | null = null;
   private toggleInProgress = false;
   private reloading = false;
   private stickySessionActive = false;
@@ -258,14 +286,27 @@ export default class DesktopStickyNotesPlugin extends Plugin {
       this.restoreStickyNotes();
       this.scheduleRefreshAllNotes();
     }));
-    this.registerEvent(this.app.workspace.on("quit", () => {
+    // A debounced opacity write, or one already in flight, would die with the
+    // renderer on quit. Starting it is not enough: Obsidian (and this plugin's
+    // reload) keeps the renderer alive only until the promises registered on
+    // the quit tasks settle, so the write is registered there to finish before
+    // the app goes away. A failed write is left for the quit tasks to receive.
+    this.registerEvent(this.app.workspace.on("quit", (tasks) => {
       this.quitting = true;
       this.cancelPendingInitializations();
+      const settingsWrite = this.flushPendingSettingsWrites();
+      if (settingsWrite) tasks.addPromise(settingsWrite);
     }));
     const mainWindow = this.app.workspace.containerEl.ownerDocument.defaultView;
+    // beforeunload has no way to delay the unload, so this is best effort.
+    // Nothing can wait for the result here, so a failure is swallowed rather
+    // than surfacing as an unhandled rejection. saveSettings() keeps its own
+    // queue's rejections handled; this returned promise would be the only
+    // unobserved one.
     if (mainWindow) this.registerDomEvent(mainWindow, "beforeunload", () => {
       this.quitting = true;
       this.cancelPendingInitializations();
+      void this.flushPendingSettingsWrites()?.catch(() => {});
     });
     // Observe already restored windows before layout readiness. Closing one
     // during startup must still remove its identity without loading its view.
@@ -299,6 +340,10 @@ export default class DesktopStickyNotesPlugin extends Plugin {
 
   private async flushSettings(): Promise<void> {
     await this.saveSettings();
+    await this.waitForSettingsWrites();
+  }
+
+  private async waitForSettingsWrites(): Promise<void> {
     // Settings controls remain usable while saving. Include any newer writes
     // queued during the wait before discarding this renderer.
     while (this.settingsSave) await this.settingsSave;
@@ -474,9 +519,16 @@ export default class DesktopStickyNotesPlugin extends Plugin {
     const closedLeafIds = new Set<string>();
     if (this.restorationTimer !== null) window.clearTimeout(this.restorationTimer);
     if (this.shortcutRegistrationTimer !== null) window.clearTimeout(this.shortcutRegistrationTimer);
+    // onunload cannot wait for the write either, so, as on beforeunload, a
+    // failure is swallowed instead of becoming an unhandled rejection.
+    void this.flushPendingSettingsWrites()?.catch(() => {});
     this.unregisterGlobalToggleShortcut();
     for (const note of [...this.allNotes()]) {
       this.rememberTopLevelPosition(note);
+      // Unloading drops the notes without untracking them one by one, so the
+      // opacity is restored here, before the window is closed below or, on
+      // quit/reload, left to Obsidian's own teardown.
+      this.restoreWindowOpacity(note);
       note.observer?.disconnect();
       // On quit/reload Obsidian owns window teardown. Detaching here can save
       // an empty layout over the windows it needs to restore at the next launch.
@@ -537,6 +589,12 @@ export default class DesktopStickyNotesPlugin extends Plugin {
     this.settings = {
       defaultFolder: stored.defaultFolder ?? defaults.defaultFolder,
       defaultNoteColor: stored.defaultNoteColor ?? defaults.defaultNoteColor,
+      windowOpacity: isWindowOpacity(stored.windowOpacity)
+        ? normalizeWindowOpacity(stored.windowOpacity)
+        : defaults.windowOpacity,
+      opaqueWhileFocused: typeof stored.opaqueWhileFocused === "boolean"
+        ? stored.opaqueWhileFocused
+        : defaults.opaqueWhileFocused,
       globalToggleShortcuts,
       topLevelNotePath: stored.topLevelNotePath ?? defaults.topLevelNotePath,
       topLevelWindowPosition: stored.topLevelWindowPosition ?? defaults.topLevelWindowPosition,
@@ -546,7 +604,13 @@ export default class DesktopStickyNotesPlugin extends Plugin {
         : []
     };
 
-    if (Object.prototype.hasOwnProperty.call(stored, "globalToggleShortcut")) {
+    // A stored opacity that was rejected or snapped to the slider's grid is
+    // written back, so that data.json and the value in use do not disagree
+    // until some unrelated setting happens to trigger the next save. A vault
+    // that never stored the key keeps its data.json untouched.
+    const opacityWasCorrected = Object.prototype.hasOwnProperty.call(stored, "windowOpacity")
+      && stored.windowOpacity !== this.settings.windowOpacity;
+    if (opacityWasCorrected || Object.prototype.hasOwnProperty.call(stored, "globalToggleShortcut")) {
       await this.saveSettings();
     }
   }
@@ -1111,9 +1175,22 @@ export default class DesktopStickyNotesPlugin extends Plugin {
     void this.saveSettings();
   }
 
+  // Whether the plugin still owns the note's window. Refresh passes run from
+  // plain timeouts and DOM events, which outlive the plugin, a closed note, a
+  // note whose leaf moved to another window, and a note whose leaf was
+  // untracked and initialized again as a new note. A pass for a note in any of
+  // those states must not decorate the window or put the configured opacity
+  // back on a window that was restored on the way out.
+  private noteIsLive(note: StickyNoteWindow): boolean {
+    return !this.unloading && !this.quitting
+      && this.initializedLeaves.has(note.leaf)
+      && !!this.notesByPath.get(note.file.path)?.has(note)
+      && note.leaf.view.containerEl.ownerDocument === note.document
+      && !note.window.isDestroyed();
+  }
+
   private prepareWindow(note: StickyNoteWindow): void {
-    if (this.unloading || this.quitting || !this.initializedLeaves.has(note.leaf) || note.window.isDestroyed()) return;
-    if (note.leaf.view.containerEl.ownerDocument !== note.document) return;
+    if (!this.noteIsLive(note)) return;
     const { document, window } = note;
     const nativeTitle = this.nativeNoteWindowTitle(note.file);
     const domWindow = document.defaultView;
@@ -1126,6 +1203,7 @@ export default class DesktopStickyNotesPlugin extends Plugin {
     document.querySelector(".workspace-tab-header-container")?.remove();
     this.applyColor(note, this.noteColor(note.file.path), false);
     this.configureWindowOwnership(note);
+    this.applyWindowOpacity(note);
     window.setResizable(true);
     this.addStickyActions(note);
     this.observePresentation(note);
@@ -1154,6 +1232,18 @@ export default class DesktopStickyNotesPlugin extends Plugin {
     const restore = () => this.scheduleRefreshNote(note);
     this.registerDomEvent(domWindow, "focus", restore);
     this.registerDomEvent(domWindow, "blur", restore);
+    // Inactive windows report the pointer entering and leaving as well
+    // (measured on macOS). A native drag region does not, so the pointer only
+    // counts once it is over the rest of the window.
+    // Guarded like the refresh passes: a pointer leaving a window that is
+    // being closed must not make it translucent again after its opacity was
+    // restored on the way out.
+    const hover = (hovered: boolean) => {
+      note.isHovered = hovered;
+      if (this.noteIsLive(note)) this.applyWindowOpacity(note);
+    };
+    this.registerDomEvent(note.document.documentElement, "mouseenter", () => hover(true));
+    this.registerDomEvent(note.document.documentElement, "mouseleave", () => hover(false));
   }
 
   private scheduleRefreshNote(note: StickyNoteWindow): void {
@@ -1291,6 +1381,107 @@ export default class DesktopStickyNotesPlugin extends Plugin {
     }
   }
 
+  setWindowOpacity(opacity: number): void {
+    // Checked before normalizing: normalization coerces its argument, so a
+    // caller outside the type system could otherwise slip a string through.
+    if (!isWindowOpacity(opacity)) return;
+    const normalized = normalizeWindowOpacity(opacity);
+    if (normalized === this.settings.windowOpacity) return;
+    this.settings.windowOpacity = normalized;
+    this.applyWindowOpacityToLiveNotes();
+    this.scheduleWindowOpacitySave();
+  }
+
+  async setOpaqueWhileFocused(enabled: boolean): Promise<void> {
+    if (enabled === this.settings.opaqueWhileFocused) return;
+    this.settings.opaqueWhileFocused = enabled;
+    this.applyWindowOpacityToLiveNotes();
+    await this.saveSettings();
+  }
+
+  private applyWindowOpacityToLiveNotes(): void {
+    for (const note of this.allNotes()) {
+      if (this.noteIsLive(note)) this.applyWindowOpacity(note);
+    }
+  }
+
+  private scheduleWindowOpacitySave(): void {
+    // Obsidian releases before 1.5.9 report a slider value per drag step, and
+    // key repeat does so in every release. Each value would otherwise queue one
+    // more write behind saveSettings(), so only the settled value is persisted.
+    // The opacity itself is applied immediately; only the write is delayed.
+    if (this.opacitySaveTimer !== null) window.clearTimeout(this.opacitySaveTimer);
+    this.opacitySaveTimer = window.setTimeout(() => {
+      this.opacitySaveTimer = null;
+      void this.saveSettings();
+    }, 400);
+  }
+
+  // Starts a debounced opacity write that has not fired yet, and returns a
+  // promise that settles once every settings write, including ones queued
+  // behind it, has reached disk. Returns null when nothing is pending.
+  //
+  // Both cases matter on shutdown: once the debounce has fired, the timer is
+  // gone but its write may still be in flight on settingsSave. Waiting only
+  // for an unfired timer would let the renderer die mid-write and lose the
+  // last opacity the user chose.
+  private flushPendingSettingsWrites(): Promise<void> | null {
+    if (this.opacitySaveTimer !== null) {
+      window.clearTimeout(this.opacitySaveTimer);
+      this.opacitySaveTimer = null;
+      return this.flushSettings();
+    }
+    if (this.settingsSave) return this.waitForSettingsWrites();
+    return null;
+  }
+
+  // Called on focus changes, on the pointer entering or leaving, and on setting
+  // changes, so a focused or hovered window is brought to full opacity and
+  // back as those change.
+  private applyWindowOpacity(note: StickyNoteWindow): void {
+    const opacity = this.targetWindowOpacity(note);
+    if (note.appliedOpacity === opacity) return;
+    // A window opens fully opaque, so the default setting needs no native call
+    // here. Returning to full opacity from a lower value still does, which is
+    // why the applied value is tracked rather than compared against the default.
+    if (note.appliedOpacity === undefined && opacity === FULL_WINDOW_OPACITY) {
+      note.appliedOpacity = opacity;
+      return;
+    }
+    this.setNativeOpacity(note.window, opacity);
+    // Recorded even when the call did not get through, so that a window with a
+    // dead remote proxy is not retried on every focus and layout pass.
+    note.appliedOpacity = opacity;
+  }
+
+  // Called whenever the plugin stops managing a window (see untrackNote() and
+  // onunload()). A close normally makes this moot, but a window that survives
+  // it must not be left translucent with nothing tracking it any more.
+  private restoreWindowOpacity(note: StickyNoteWindow): void {
+    if (note.appliedOpacity === undefined || note.appliedOpacity === FULL_WINDOW_OPACITY) return;
+    this.setNativeOpacity(note.window, FULL_WINDOW_OPACITY);
+    note.appliedOpacity = FULL_WINDOW_OPACITY;
+  }
+
+  private targetWindowOpacity(note: StickyNoteWindow): number {
+    const { windowOpacity, opaqueWhileFocused } = this.settings;
+    if (!opaqueWhileFocused || windowOpacity === FULL_WINDOW_OPACITY) return windowOpacity;
+    // The document's own focus state is what the focus and blur events that
+    // trigger this describe, so it agrees with them. The native window's state
+    // is a synchronous call into the main process and can lag those events.
+    // Hovering is tracked from the pointer entering and leaving the document.
+    return note.document.hasFocus() || note.isHovered ? FULL_WINDOW_OPACITY : windowOpacity;
+  }
+
+  private setNativeOpacity(nativeWindow: NativeBrowserWindow, opacity: number): void {
+    try {
+      if (nativeWindow.isDestroyed()) return;
+      nativeWindow.setOpacity(opacity);
+    } catch {
+      // The remote proxy becomes invalid as soon as the window closes.
+    }
+  }
+
   private noteColor(path: string): string {
     return this.settings.colorsByPath[path] ?? this.settings.defaultNoteColor;
   }
@@ -1302,6 +1493,15 @@ export default class DesktopStickyNotesPlugin extends Plugin {
   }
 
   private untrackNote(note: StickyNoteWindow): void {
+    // Every path that stops managing a single window goes through here:
+    // hiding, deleting the file, the toggle shortcut, the window's own
+    // beforeunload, the popout closing and a failed setup (onunload() drops
+    // all notes at once and restores them itself). Restoring here keeps the
+    // invariant that an untracked window is fully opaque. Some of those
+    // windows survive (a canceled close, a setup that restoration retries) and
+    // are initialized again as a new note, whose first opacity pass relies on
+    // the window starting out fully opaque.
+    this.restoreWindowOpacity(note);
     note.observer?.disconnect();
     this.initializedLeaves.delete(note.leaf);
     const notes = this.notesByPath.get(note.file.path);
@@ -1445,6 +1645,16 @@ class DesktopStickyNotesSettingTab extends PluginSettingTab {
         render: (setting) => this.addDefaultColorControl(setting)
       },
       {
+        name: "Window opacity",
+        desc: "Opacity of every sticky-note window. Fully opaque by default.",
+        render: (setting) => this.addWindowOpacityControl(setting)
+      },
+      {
+        name: "Opaque while focused or hovered",
+        desc: "Keep a sticky note fully opaque while its window has the focus or the pointer is over it, so that it stays easy to read while you work in it or look at it. Applies only when window opacity is below 100%.",
+        render: (setting) => this.addOpaqueWhileFocusedControl(setting)
+      },
+      {
         name: "Global toggle shortcut",
         desc: "System-wide shortcut for toggling the top-level sticky note. Click the shortcut, press a new combination, or press escape to cancel.",
         render: (setting) => this.addGlobalShortcutControl(setting)
@@ -1467,6 +1677,12 @@ class DesktopStickyNotesSettingTab extends PluginSettingTab {
     this.addDefaultColorControl(new Setting(containerEl)
       .setName("Default note color")
       .setDesc("Background color used for notes that do not have a saved custom color."));
+    this.addWindowOpacityControl(new Setting(containerEl)
+      .setName("Window opacity")
+      .setDesc("Opacity of every sticky-note window. Fully opaque by default."));
+    this.addOpaqueWhileFocusedControl(new Setting(containerEl)
+      .setName("Opaque while focused or hovered")
+      .setDesc("Keep a sticky note fully opaque while its window has the focus or the pointer is over it, so that it stays easy to read while you work in it or look at it. Applies only when window opacity is below 100%."));
     this.addGlobalShortcutControl(new Setting(containerEl)
       .setName("Global toggle shortcut")
       .setDesc("System-wide shortcut for toggling the top-level sticky note. Click the shortcut, press a new combination, or press escape to cancel."));
@@ -1497,6 +1713,19 @@ class DesktopStickyNotesSettingTab extends PluginSettingTab {
         this.plugin.settings.defaultNoteColor = value;
         await this.plugin.saveSettings();
       }));
+  }
+
+  private addWindowOpacityControl(setting: Setting): void {
+    setting.addSlider((slider) => slider
+      .setLimits(MIN_WINDOW_OPACITY, FULL_WINDOW_OPACITY, WINDOW_OPACITY_STEP)
+      .setValue(this.plugin.settings.windowOpacity)
+      .onChange((value) => this.plugin.setWindowOpacity(value)));
+  }
+
+  private addOpaqueWhileFocusedControl(setting: Setting): void {
+    setting.addToggle((toggle) => toggle
+      .setValue(this.plugin.settings.opaqueWhileFocused)
+      .onChange((value) => void this.plugin.setOpaqueWhileFocused(value)));
   }
 
   private addGlobalShortcutControl(setting: Setting): () => void {

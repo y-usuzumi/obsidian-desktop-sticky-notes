@@ -86,6 +86,9 @@ function createDocument() {
     documentElement: new Element(),
     body: new Element(),
     tabHeadersPresent: true,
+    // Whether the document has the input focus, as document.hasFocus() reports.
+    focused: false,
+    hasFocus() { return this.focused; },
     querySelector(selector) {
       return selector === ".workspace-tab-header-container" && this.tabHeadersPresent
         ? { remove: () => { this.tabHeadersPresent = false; } }
@@ -210,6 +213,9 @@ function createHarness(settings = {}, layoutReady = false, supportsDeferredViews
     });
     const nativeWindow = {
       destroyed: false, closes: 0, destroys: 0, focused: false, alwaysOnTop: false,
+      // A native window starts fully opaque; opacityCalls counts remote calls.
+      opacity: 1, opacityCalls: 0,
+      setOpacity(value) { this.opacityCalls++; this.opacity = value; },
       setResizable() {}, setParentWindow(parent) { this.parent = parent; }, setSkipTaskbar() {},
       setAlwaysOnTop(value) { this.alwaysOnTop = value; }, isAlwaysOnTop() { return this.alwaysOnTop; },
       setTitle(title) { nativeTitle = title; document.title = title; },

@@ -23,12 +23,14 @@ Fully quit Obsidian before installing 1.0.7 to clear orphaned windows left by ol
 If a window already lost its sticky-note controls before installing this fix, close that window and use **Open sticky note for current file** once after updating. A previously unmarked regular window cannot be distinguished safely from an ordinary popout of the same file.
 
 > [!NOTE]
-> On Linux, **Keep on top** works when Obsidian runs under X11 or XWayland. Electron does not support the required always-on-top window state under native Wayland, so the pin control cannot change window stacking in a native Wayland session.
+> On Linux, **Keep on top** works when Obsidian runs under X11 or XWayland. Electron does not support the required always-on-top window state under native Wayland, so the pin control cannot change window stacking in a native Wayland session. Electron implements **Window opacity** on Windows and macOS only, so that setting has no visible effect on Linux.
 
 ## Settings
 
 - **Default notes folder** — where newly created sticky-note files are stored; defaults to the vault root.
 - **Default note color** — the initial background color for notes without a saved custom color.
+- **Window opacity** — how opaque every sticky-note window is, from 20% to fully opaque. The default keeps every window fully opaque, and the value applies to all sticky notes at once.
+- **Opaque while focused or hovered** — brings a sticky note to full opacity while its window has the focus or the pointer is over it, so that the note stays easy to read while you work in it or look at it, and returns it to the configured opacity when both the focus and the pointer have moved elsewhere. On macOS, a window drag region, normally the note header, does not report the pointer, so hovering only there does not count. On by default, and only noticeable when window opacity is below 100%.
 - **Global toggle shortcut** — toggles the top-level sticky note even when Obsidian is in the background. Click the recorder and press the desired combination, or clear it to disable the shortcut. The default is `Win+F10` on Windows, `Super+F10` on Linux, and `Option+F10` on macOS. The plugin stores this setting separately for each operating system, so syncing a vault between computers does not translate one platform's shortcut into another platform's keys.
 - **Top-level note** — the Markdown file controlled by the toggle command and global shortcut.
 
